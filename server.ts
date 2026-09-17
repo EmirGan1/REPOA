@@ -35,13 +35,15 @@ const defaultDb = {
   messages: [] as any[],
   global_messages: [] as any[],
   groups: [] as any[],
-  group_messages: [] as any[]
+  group_messages: [] as any[],
+  notifications: [] as any[]
 };
 let db = defaultDb;
 if (fs.existsSync(DB_FILE)) {
   try {
     const parsed = JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
     db = { ...defaultDb, ...parsed };
+    if (!db.notifications) db.notifications = [];
   } catch (e) {
     db = defaultDb;
   }
@@ -73,10 +75,12 @@ async function startServer() {
     }
     const hash = await bcrypt.hash(password, 10);
     const token = crypto.randomUUID();
-    const newUser = { id: getNextId("users"), username, password: hash, avatar: null, token, last_seen: new Date().toISOString() };
+    const colors = ["bg-red-500", "bg-blue-500", "bg-green-500", "bg-yellow-500", "bg-purple-500", "bg-pink-500", "bg-indigo-500", "bg-teal-500"];
+    const randomColor = colors[Math.floor(Math.random() * colors.length)];
+    const newUser = { id: getNextId("users"), username, password: hash, avatar: null, color: randomColor, token, last_seen: new Date().toISOString() };
     db.users.push(newUser);
     saveDb();
-    res.json({ token, username, id: newUser.id });
+    res.json({ token, username, id: newUser.id, color: randomColor });
   });
 
   app.post("/api/login", async (req, res) => {
@@ -85,8 +89,12 @@ async function startServer() {
     if (user && await bcrypt.compare(password, user.password)) {
       const token = crypto.randomUUID();
       user.token = token;
+      if (!user.color) {
+        const colors = ["bg-red-500", "bg-blue-500", "bg-green-500", "bg-yellow-500", "bg-purple-500", "bg-pink-500", "bg-indigo-500", "bg-teal-500"];
+        user.color = colors[Math.floor(Math.random() * colors.length)];
+      }
       saveDb();
-      res.json({ token, username, avatar: user.avatar, id: user.id });
+      res.json({ token, username, avatar: user.avatar, id: user.id, color: user.color });
     } else {
       res.status(401).json({ error: "Geçersiz giriş." });
     }
@@ -123,7 +131,7 @@ async function startServer() {
         const pUser = getUser(p.user_id);
         const likes_count = db.likes.filter(l => l.post_id === p.id).length;
         const is_liked = db.likes.some(l => l.post_id === p.id && l.user_id === user.id);
-        return { ...p, username: pUser?.username, avatar: pUser?.avatar, likes_count, is_liked };
+        return { ...p, username: pUser?.username, avatar: pUser?.avatar, color: pUser?.color, likes_count, is_liked };
       }).sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
       cb(posts);
     });
@@ -146,7 +154,7 @@ async function startServer() {
     socket.on("get_comments", async (postId, cb) => {
       const comments = db.comments.filter(c => c.post_id === postId).map(c => {
         const cUser = getUser(c.user_id);
-        return { ...c, username: cUser?.username, avatar: cUser?.avatar };
+        return { ...c, username: cUser?.username, avatar: cUser?.avatar, color: cUser?.color };
       }).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
       cb(comments);
     });
@@ -163,7 +171,7 @@ async function startServer() {
       const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
       const stories = db.stories.filter(s => new Date(s.created_at) >= oneDayAgo).map(s => {
         const sUser = getUser(s.user_id);
-        return { ...s, username: sUser?.username, avatar: sUser?.avatar };
+        return { ...s, username: sUser?.username, avatar: sUser?.avatar, color: sUser?.color };
       }).sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
       cb(stories);
     });
@@ -173,6 +181,31 @@ async function startServer() {
       saveDb();
       io.emit("stories_updated");
       if(cb) cb();
+    });
+
+    const addNotification = (userId: number, type: string, content: string) => {
+      if (userId === user.id) return;
+      const notif = { id: getNextId("notifications"), user_id: userId, type, content, read: false, created_at: new Date().toISOString() };
+      db.notifications.push(notif);
+      saveDb();
+      const s = onlineUsers.get(userId);
+      if (s) io.to(s).emit("new_notification", notif);
+    };
+
+    socket.on("get_notifications", (cb) => {
+      const notifs = db.notifications.filter((n: any) => n.user_id === user.id).sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+      cb(notifs);
+    });
+
+    socket.on("mark_notifications_read", () => {
+      let changed = false;
+      db.notifications.forEach((n: any) => {
+        if (n.user_id === user.id && !n.read) {
+          n.read = true;
+          changed = true;
+        }
+      });
+      if (changed) saveDb();
     });
 
     // Friends
@@ -205,6 +238,7 @@ async function startServer() {
         saveDb();
         const targetSocket = onlineUsers.get(targetId);
         if (targetSocket) io.to(targetSocket).emit("friends_updated");
+        addNotification(targetId, "friend_request", `${user.username} sana arkadaşlık isteği gönderdi.`);
       }
       if(cb) cb();
     });
@@ -216,8 +250,14 @@ async function startServer() {
         saveDb();
         const targetSocket = onlineUsers.get(targetId);
         if (targetSocket) io.to(targetSocket).emit("friends_updated");
+        addNotification(targetId, "friend_accept", `${user.username} arkadaşlık isteğini kabul etti.`);
       }
       if(cb) cb();
+    });
+
+    socket.on("get_all_users", async (cb) => {
+      const users = db.users.map(u => ({ id: u.id, username: u.username, avatar: u.avatar, color: u.color }));
+      cb(users);
     });
 
     // Chat
@@ -228,19 +268,32 @@ async function startServer() {
     });
 
     socket.on("send_message", async (data) => {
-      const { receiver, type, content } = data;
-      const newMsg = { id: getNextId("messages"), sender: user.id, receiver, type, content, created_at: new Date().toISOString() };
+      const { receiver, type, content, reply_to } = data;
+      const newMsg = { id: getNextId("messages"), sender: user.id, receiver, type, content, reply_to, reactions: [], created_at: new Date().toISOString() };
       db.messages.push(newMsg);
       saveDb();
       
       const targetSocket = onlineUsers.get(receiver);
       if (targetSocket) io.to(targetSocket).emit("new_message", newMsg);
       socket.emit("new_message", newMsg); // echo back
+      addNotification(receiver, "new_message", `${user.username} sana yeni bir mesaj gönderdi.`);
     });
 
     const populateMessage = (m: any) => {
       const sUser = getUser(m.sender);
-      return { ...m, sender_name: sUser?.username, sender_avatar: sUser?.avatar };
+      let replyMsg = null;
+      if (m.reply_to) {
+         // Figure out which table to look at
+         let sourceTbl = db.messages;
+         if (m.group_id) sourceTbl = db.group_messages;
+         else if (db.global_messages.some(gm => gm.id === m.id)) sourceTbl = db.global_messages;
+         const refMsg = sourceTbl.find((x: any) => x.id === m.reply_to);
+         if (refMsg) {
+           const refUser = getUser(refMsg.sender);
+           replyMsg = { ...refMsg, sender_name: refUser?.username };
+         }
+      }
+      return { ...m, sender_name: sUser?.username, sender_avatar: sUser?.avatar, sender_color: sUser?.color, reply_message: replyMsg };
     };
 
     // Global Chat
@@ -249,8 +302,8 @@ async function startServer() {
     });
 
     socket.on("send_global_message", async (data) => {
-      const { type, content } = data;
-      const newMsg = { id: getNextId("global_messages"), sender: user.id, type, content, created_at: new Date().toISOString() };
+      const { type, content, reply_to } = data;
+      const newMsg = { id: getNextId("global_messages"), sender: user.id, type, content, reply_to, reactions: [], created_at: new Date().toISOString() };
       db.global_messages.push(newMsg);
       saveDb();
       io.emit("new_global_message", populateMessage(newMsg));
@@ -271,6 +324,7 @@ async function startServer() {
       allMembers.forEach((memberId: number) => {
         const targetSocket = onlineUsers.get(memberId);
         if (targetSocket) io.to(targetSocket).emit("groups_updated");
+        addNotification(memberId, "group_invite", `${user.username} seni ${name} grubuna ekledi.`);
       });
       if(cb) cb(newGroup);
     });
@@ -283,8 +337,8 @@ async function startServer() {
     });
 
     socket.on("send_group_message", async (data) => {
-      const { group_id, type, content } = data;
-      const newMsg = { id: getNextId("group_messages"), group_id, sender: user.id, type, content, created_at: new Date().toISOString() };
+      const { group_id, type, content, reply_to } = data;
+      const newMsg = { id: getNextId("group_messages"), group_id, sender: user.id, type, content, reply_to, reactions: [], created_at: new Date().toISOString() };
       db.group_messages.push(newMsg);
       saveDb();
       
@@ -294,8 +348,52 @@ async function startServer() {
         group.members.forEach((memberId: number) => {
           const targetSocket = onlineUsers.get(memberId);
           if (targetSocket) io.to(targetSocket).emit("new_group_message", popMsg);
+          addNotification(memberId, "new_group_message", `${group.name} grubuna yeni bir mesaj geldi.`);
         });
       }
+    });
+
+    socket.on("typing", (data) => {
+      // data: { type: 'global' | 'group' | 'private', receiver?: number, group_id?: number }
+      if (data.type === 'private') {
+        const targetSocket = onlineUsers.get(data.receiver);
+        if (targetSocket) io.to(targetSocket).emit("user_typing", { type: 'private', sender: user.id });
+      } else if (data.type === 'group') {
+        const group = db.groups.find((g: any) => g.id === data.group_id);
+        if (group) {
+          group.members.forEach((memberId: number) => {
+            if (memberId !== user.id) {
+              const targetSocket = onlineUsers.get(memberId);
+              if (targetSocket) io.to(targetSocket).emit("user_typing", { type: 'group', group_id: data.group_id, sender: user.id });
+            }
+          });
+        }
+      } else if (data.type === 'global') {
+        socket.broadcast.emit("user_typing", { type: 'global', sender: user.id });
+      }
+    });
+
+    socket.on("react_message", (data) => {
+       // data: { type: 'private' | 'group' | 'global', message_id, emoji }
+       let msgList;
+       if (data.type === 'private') msgList = db.messages;
+       else if (data.type === 'group') msgList = db.group_messages;
+       else if (data.type === 'global') msgList = db.global_messages;
+       
+       if (msgList) {
+         const msg = msgList.find((m: any) => m.id === data.message_id);
+         if (msg) {
+           if (!msg.reactions) msg.reactions = [];
+           const existingIdx = msg.reactions.findIndex((r: any) => r.user_id === user.id && r.emoji === data.emoji);
+           if (existingIdx > -1) {
+             msg.reactions.splice(existingIdx, 1);
+           } else {
+             msg.reactions.push({ user_id: user.id, emoji: data.emoji });
+           }
+           saveDb();
+           io.emit("message_reacted", { type: data.type, message_id: data.message_id, reactions: msg.reactions });
+         }
+       }
     });
 
     socket.on("update_avatar", async (url) => {

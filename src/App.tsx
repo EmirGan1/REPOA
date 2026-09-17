@@ -9,26 +9,56 @@ import Profile from "./components/Profile";
 import GlobalChat from "./components/GlobalChat";
 
 export default function App() {
-  const [token, setToken] = useState<string | null>(localStorage.getItem("lan_token"));
-  const [username, setUsername] = useState<string>(localStorage.getItem("lan_username") || "");
-  const [avatar, setAvatar] = useState<string | null>(localStorage.getItem("lan_avatar"));
+  const [token, setToken] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem("lan_token");
+    } catch {
+      return null;
+    }
+  });
+  const [username, setUsername] = useState<string>(() => {
+    try {
+      return localStorage.getItem("lan_username") || "";
+    } catch {
+      return "";
+    }
+  });
+  const [avatar, setAvatar] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem("lan_avatar");
+    } catch {
+      return null;
+    }
+  });
   
   const [socket, setSocket] = useState<Socket | null>(null);
   const [onlineUsers, setOnlineUsers] = useState<number[]>([]);
-  const [currentUserId, setCurrentUserId] = useState<number>(Number(localStorage.getItem("lan_user_id")) || 0);
+  const [currentUserId, setCurrentUserId] = useState<number>(() => {
+    try {
+      return Number(localStorage.getItem("lan_user_id")) || 0;
+    } catch {
+      return 0;
+    }
+  });
   
   const [activeTab, setActiveTab] = useState<"global" | "chats" | "feed" | "friends" | "profile">("chats");
 
   useEffect(() => {
     if (token) {
-      const newSocket = io({ auth: { token } });
+      // iOS uyumlu websocket ve polling fallback yapılandırması
+      const newSocket = io({
+        auth: { token },
+        transports: ["polling", "websocket"],
+        reconnectionAttempts: 5,
+      });
       
       newSocket.on("connect", () => {
         setSocket(newSocket);
       });
 
-      newSocket.on("connect_error", () => {
-        handleLogout();
+      // Anlık bağlantı gecikmesinde hemen oturumu kapatmayı engeller
+      newSocket.on("connect_error", (err) => {
+        console.warn("Socket bağlantı denemesi sürüyor:", err.message);
       });
 
       newSocket.on("online_users", (users: number[]) => {
@@ -37,7 +67,11 @@ export default function App() {
 
       newSocket.on("your_id", (id: number) => {
         setCurrentUserId(id);
-        localStorage.setItem("lan_user_id", id.toString());
+        try {
+          localStorage.setItem("lan_user_id", id.toString());
+        } catch (e) {
+          console.error(e);
+        }
       });
 
       return () => {
@@ -47,36 +81,38 @@ export default function App() {
   }, [token]);
 
   const handleAuthSuccess = (newToken: string, newUsername: string, newAvatar: string | null, id: number) => {
-    localStorage.setItem("lan_token", newToken);
-    localStorage.setItem("lan_username", newUsername);
-    localStorage.setItem("lan_user_id", id.toString());
-    if(newAvatar) localStorage.setItem("lan_avatar", newAvatar);
+    try {
+      localStorage.setItem("lan_token", newToken);
+      localStorage.setItem("lan_username", newUsername);
+      localStorage.setItem("lan_user_id", id.toString());
+      if (newAvatar) localStorage.setItem("lan_avatar", newAvatar);
+    } catch (e) {
+      console.error("Depolama hatası:", e);
+    }
+
+    // State'leri güncelleyerek sayfayı yenilemeden uygulamaya alıyoruz
     setToken(newToken);
     setUsername(newUsername);
     setAvatar(newAvatar);
     setCurrentUserId(id);
-    window.location.reload();
   };
 
   const handleLogout = () => {
-    localStorage.removeItem("lan_token");
-    localStorage.removeItem("lan_username");
-    localStorage.removeItem("lan_avatar");
-    localStorage.removeItem("lan_user_id");
+    try {
+      localStorage.removeItem("lan_token");
+      localStorage.removeItem("lan_username");
+      localStorage.removeItem("lan_avatar");
+      localStorage.removeItem("lan_user_id");
+    } catch (e) {
+      console.error(e);
+    }
     setToken(null);
     if (socket) socket.disconnect();
-    window.location.reload();
   };
 
   if (!token) {
     return <Auth onAuthSuccess={handleAuthSuccess} />;
   }
-
-  // To find currentUserId, we can just fetch it implicitly from any friend or assume it's set on backend.
-  // Actually, we need currentUserId in Chats.tsx for `isMine = msg.sender === currentUserId`.
-  // To get it, we can decode it, or since we didn't return it, we can just use a quick socket call if we added one, but we didn't. 
-  // Workaround: when we send a message, we see it echo. Or we can just modify the backend to emit "your_id" on connect!
-  // I will just add that to the backend quickly.
 
   return (
     <div className="flex h-screen bg-white md:bg-slate-50 overflow-hidden font-sans">
@@ -140,4 +176,3 @@ function MobileNavItem({ icon, active, onClick }: { icon: React.ReactNode, activ
     </button>
   );
 }
-
